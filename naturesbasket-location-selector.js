@@ -15,7 +15,9 @@ import path from 'path';
  * - HTML export
  * - Waits for user input before closing
  */
-async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://www.naturesbasket.co.in/search?q=tomato') {
+async function selectLocationOnNaturesBasket(locationName, productName = 'tomato') {
+  // Construct search URL from product name
+  const searchUrl = `https://www.naturesbasket.co.in/search?q=${encodeURIComponent(productName)}`;
   // Launch Chrome browser - opens only once
   let browser;
   let context;
@@ -195,37 +197,83 @@ async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://
     await page.waitForTimeout(1500);
 
     // Step 3: Find and click location suggestion
-    // Proven MCP selector: //div[@role='dialog']//*[contains(text(), 'LocationName') and not(contains(...airport...)) and not(contains(...railway...)) and not(contains(...station...))]
     let suggestionClicked = false;
     
-    const suggestionXpath = `//div[@role='dialog']//*[contains(text(), '${locationName}') and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'airport')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'railway')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'station'))]`;
-    
-    const suggestionSelectors = [
-      suggestionXpath,
-      `xpath=//div[@role='dialog']//*[contains(text(), '${locationName}')]`,
-      `div[role="dialog"] *:has-text("${locationName}")`,
-      `text=${locationName}`
+    // Generate location name variations to handle different formats
+    const locationVariations = [
+      locationName,                           // Exact: "RT Nagar"
+      locationName.replace(/\s+/g, ''),      // No spaces: "RTNagar"
+      locationName.replace(/\s+/g, ' '),     // Normalized: "RT Nagar"
+      locationName.toLowerCase(),             // Lowercase: "rt nagar"
+      locationName.toUpperCase(),             // Uppercase: "RT NAGAR"
+      locationName.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') // Title case
     ];
+    
+    // Remove duplicates
+    const uniqueVariations = [...new Set(locationVariations)];
+    
+    // Build multiple selector strategies
+    const suggestionSelectors = [];
+    
+    for (const loc of uniqueVariations) {
+      // Strategy 1: In dialog, excluding airport/railway/station
+      suggestionSelectors.push(`xpath=//div[@role='dialog']//*[contains(text(), '${loc}') and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'airport')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'railway')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'station'))]`);
+      
+      // Strategy 2: In dialog, any element
+      suggestionSelectors.push(`xpath=//div[@role='dialog']//*[contains(text(), '${loc}')]`);
+      
+      // Strategy 3: List items in dialog
+      suggestionSelectors.push(`xpath=//div[@role='dialog']//li[contains(text(), '${loc}')]`);
+      
+      // Strategy 4: Divs in dialog
+      suggestionSelectors.push(`xpath=//div[@role='dialog']//div[contains(text(), '${loc}')]`);
+      
+      // Strategy 5: Playwright has-text
+      suggestionSelectors.push(`div[role="dialog"] *:has-text("${loc}")`);
+      
+      // Strategy 6: Text locator
+      suggestionSelectors.push(`text=${loc}`);
+    }
 
     for (const selector of suggestionSelectors) {
       try {
+        let suggestion;
         if (selector.startsWith('xpath=') || selector.startsWith('//')) {
           const xpath = selector.startsWith('xpath=') ? selector.replace('xpath=', '') : selector;
-          const suggestion = page.locator(xpath).first();
-          await suggestion.waitFor({ timeout: 5000, state: 'visible' });
-          if (await suggestion.isVisible({ timeout: 2000 })) {
-            await suggestion.click({ timeout: 2000, force: true });
+          suggestion = page.locator(xpath).first();
+        } else {
+          suggestion = page.locator(selector).first();
+        }
+        
+        await suggestion.waitFor({ timeout: 3000, state: 'visible' });
+        if (await suggestion.isVisible({ timeout: 2000 })) {
+          // Scroll into view
+          await suggestion.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(500);
+          
+          // Try regular click
+          try {
+            await suggestion.click({ timeout: 2000 });
             suggestionClicked = true;
             console.log(`✓ Location suggestion clicked: ${locationName}`);
             break;
-          }
-        } else {
-          const suggestion = page.locator(selector).first();
-          if (await suggestion.isVisible({ timeout: 5000 })) {
-            await suggestion.click({ timeout: 2000, force: true });
-            suggestionClicked = true;
-            console.log(`✓ Location suggestion clicked using: ${selector}`);
-            break;
+          } catch (e) {
+            // Try force click
+            try {
+              await suggestion.click({ timeout: 2000, force: true });
+              suggestionClicked = true;
+              console.log(`✓ Location suggestion clicked (force): ${locationName}`);
+              break;
+            } catch (e2) {
+              // Try JavaScript click
+              const elementHandle = await suggestion.elementHandle();
+              if (elementHandle) {
+                await elementHandle.click();
+                suggestionClicked = true;
+                console.log(`✓ Location suggestion clicked (JS): ${locationName}`);
+                break;
+              }
+            }
           }
         }
       } catch (e) {
@@ -234,7 +282,7 @@ async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://
     }
 
     if (!suggestionClicked) {
-      console.log(`⚠ Warning: Could not click location suggestion automatically`);
+      throw new Error(`Could not click location suggestion for: ${locationName}`);
     }
 
     console.log(`Waiting for location to be applied...`);
@@ -310,7 +358,12 @@ async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://
     // Step 8: Get the HTML of the final page
     console.log(`Getting final page HTML...`);
     const pageHtml = await page.content();
-    const htmlPath = `naturesbasket-${locationName.toLowerCase().replace(/\s+/g, '-')}-final.html`;
+    // Ensure output directory exists
+    const outputDir = 'output';
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+    const htmlPath = path.join(outputDir, `naturesbasket-${locationName.toLowerCase().replace(/\s+/g, '-')}-final.html`);
     fs.writeFileSync(htmlPath, pageHtml, 'utf8');
     console.log(`✓ Page HTML saved: ${htmlPath}`);
     console.log(`✓ HTML length: ${pageHtml.length} characters`);
@@ -318,10 +371,7 @@ async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://
     console.log(`\n✅ Location "${locationName}" selected successfully!`);
     console.log(`📄 Final page HTML returned and saved to: ${htmlPath}`);
     
-    // Wait for user to press Enter before closing browser
-    await waitForEnter();
-    
-    // Close browser
+    // Close browser AFTER HTML is retrieved
     await browser.close();
     console.log('Browser closed.');
 
@@ -337,10 +387,7 @@ async function selectLocationOnNaturesBasket(locationName, searchUrl = 'https://
       // Ignore screenshot errors
     }
     
-    // Wait for user input even on error
-    console.log('\nPress Enter to close the browser...');
-    await waitForEnter();
-    
+    // Close browser on error
     await browser.close();
     throw error;
   }
@@ -365,15 +412,15 @@ function waitForEnter() {
 async function main() {
   const locations = ['Mumbai', 'Bangalore', 'Chennai', 'Madurai'];
   
-  // Get location and URL from command line arguments
+  // Get location and product from command line arguments
   const locationToSelect = process.argv[2] || locations[0];
-  const searchUrl = process.argv[3] || 'https://www.naturesbasket.co.in/search?q=tomato';
+  const productName = process.argv[3] || 'tomato';
   
   console.log(`\n🚀 Starting Nature's Basket location selection`);
   console.log(`📍 Location: ${locationToSelect}`);
-  console.log(`🌐 URL: ${searchUrl}\n`);
+  console.log(`🛍️ Product: ${productName}\n`);
   
-  const pageHtml = await selectLocationOnNaturesBasket(locationToSelect, searchUrl);
+  const pageHtml = await selectLocationOnNaturesBasket(locationToSelect, productName);
   console.log(`\n📊 Page HTML length: ${pageHtml.length} characters`);
   return pageHtml;
 }

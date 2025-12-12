@@ -1,5 +1,6 @@
 import { chromium } from 'playwright';
 import * as fs from 'fs';
+import path from 'path';
 
 /**
  * Playwright script to automate location selection and product search on D-Mart
@@ -81,35 +82,86 @@ async function selectLocationAndSearchOnDmart(locationName, productName = 'potat
     await page.waitForTimeout(1000);
     
     // Wait for suggestions to appear and select the location
-    // Selector found via MCP: //ul//*[contains(text(), 'LocationName') and not(contains(...airport...)) and not(contains(...railway...)) and not(contains(...station...)) and not(contains(...temple...))]
     let suggestionClicked = false;
     
-    // Build the XPath for the suggestion (excluding airport, railway, station, temple)
-    const suggestionXpath = `xpath=//ul//*[contains(text(), '${locationName}') and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'airport')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'railway')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'station')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'temple'))]`;
+    // Generate location name variations to handle different formats
+    const locationVariations = [
+      locationName,                           // Exact: "RT Nagar"
+      locationName.replace(/\s+/g, ''),      // No spaces: "RTNagar"
+      locationName.replace(/\s+/g, ' '),     // Normalized: "RT Nagar"
+      locationName.toLowerCase(),             // Lowercase: "rt nagar"
+      locationName.toUpperCase(),             // Uppercase: "RT NAGAR"
+      locationName.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') // Title case
+    ];
     
-    try {
-      const suggestion = page.locator(suggestionXpath).first();
-      if (await suggestion.isVisible({ timeout: 5000 })) {
-        await suggestion.click({ timeout: 2000 });
-        suggestionClicked = true;
-        console.log(`Location suggestion clicked: ${locationName}`);
-      }
-    } catch (e) {
-      // Fallback: try simpler selector
+    // Remove duplicates
+    const uniqueVariations = [...new Set(locationVariations)];
+    
+    // Build multiple XPath strategies
+    const suggestionStrategies = [];
+    
+    for (const loc of uniqueVariations) {
+      // Strategy 1: In ul elements, excluding airport/railway/station/temple
+      suggestionStrategies.push(`xpath=//ul//*[contains(text(), '${loc}') and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'airport')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'railway')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'station')) and not(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'temple'))]`);
+      
+      // Strategy 2: In list items
+      suggestionStrategies.push(`xpath=//li[contains(text(), '${loc}')]`);
+      
+      // Strategy 3: In divs within dialog
+      suggestionStrategies.push(`xpath=//div[@role='dialog']//div[contains(text(), '${loc}')]`);
+      
+      // Strategy 4: Any element with location text (excluding input)
+      suggestionStrategies.push(`xpath=//*[contains(text(), '${loc}') and not(self::input) and not(ancestor::input)]`);
+      
+      // Strategy 5: Playwright text locator
+      suggestionStrategies.push(`text=${loc}`);
+    }
+    
+    // Try each strategy
+    for (const selector of suggestionStrategies) {
       try {
-        const fallbackSuggestion = page.locator(`ul >> text=${locationName}`).first();
-        if (await fallbackSuggestion.isVisible({ timeout: 3000 })) {
-          await fallbackSuggestion.click({ timeout: 2000 });
-          suggestionClicked = true;
-          console.log(`Location suggestion clicked using fallback: ${locationName}`);
+        let suggestion;
+        if (selector.startsWith('xpath=')) {
+          const xpath = selector.replace('xpath=', '');
+          suggestion = page.locator(xpath).first();
+        } else {
+          suggestion = page.locator(selector).first();
         }
-      } catch (e2) {
-        console.log(`Warning: Could not click location suggestion`);
+        
+        if (await suggestion.isVisible({ timeout: 3000 })) {
+          // Scroll into view
+          await suggestion.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(500);
+          
+          // Try regular click
+          try {
+            await suggestion.click({ timeout: 2000 });
+            suggestionClicked = true;
+            console.log(`✓ Location suggestion clicked: ${locationName} using ${selector.substring(0, 50)}...`);
+            break;
+          } catch (e) {
+            // Try force click
+            try {
+              await suggestion.click({ timeout: 2000, force: true });
+              suggestionClicked = true;
+              console.log(`✓ Location suggestion clicked (force): ${locationName} using ${selector.substring(0, 50)}...`);
+              break;
+            } catch (e2) {
+              // Try JavaScript click
+              await page.evaluate((el) => el.click(), await suggestion.elementHandle());
+              suggestionClicked = true;
+              console.log(`✓ Location suggestion clicked (JS): ${locationName} using ${selector.substring(0, 50)}...`);
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        continue;
       }
     }
 
     if (!suggestionClicked) {
-      console.log(`Warning: Could not click location suggestion, proceeding to confirm button`);
+      throw new Error(`Could not click location suggestion for: ${locationName}`);
     }
 
     console.log(`Waiting for location to be applied...`);
@@ -250,14 +302,24 @@ async function selectLocationAndSearchOnDmart(locationName, productName = 'potat
 
     // Get the HTML of the search results page
     const pageHtml = await page.content();
-    const htmlPath = `dmart-${locationName.toLowerCase().replace(/\s+/g, '-')}-${productName.toLowerCase().replace(/\s+/g, '-')}-search-results.html`;
+    // Ensure output directory exists
+    const outputDir = 'output';
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+    const htmlPath = path.join(outputDir, `dmart-${locationName.toLowerCase().replace(/\s+/g, '-')}-${productName.toLowerCase().replace(/\s+/g, '-')}-search-results.html`);
     fs.writeFileSync(htmlPath, pageHtml, 'utf8');
     console.log(`Search results HTML saved: ${htmlPath}`);
 
     console.log(`Location "${locationName}" selected and product "${productName}" searched successfully!`);
     console.log(`Search results HTML returned and saved to: ${htmlPath}`);
 
-    // Return the HTML before closing
+    // Close browser AFTER HTML is retrieved
+    console.log('\n=== Closing browser ===');
+    await browser.close();
+    console.log('Browser closed.');
+
+    // Return the HTML
     return pageHtml;
 
   } catch (error) {
@@ -268,12 +330,14 @@ async function selectLocationAndSearchOnDmart(locationName, productName = 'potat
     } catch (e) {
       // Ignore screenshot errors
     }
+    // Close browser on error
+    try {
+      await browser.close();
+      console.log('Browser closed after error.');
+    } catch (e) {
+      // Ignore if already closed
+    }
     throw error;
-  } finally {
-    // Close the browser
-    console.log('\n=== Closing browser ===');
-    await browser.close();
-    console.log('Browser closed.');
   }
 }
 
@@ -296,7 +360,6 @@ async function main() {
 // Run the script only if called directly (not when imported as a module)
 // Check if this file is being run directly by comparing the script path
 import { fileURLToPath } from 'url';
-import path from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __basename = path.basename(__filename);

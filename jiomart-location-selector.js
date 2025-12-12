@@ -7,7 +7,9 @@ import path from 'path';
  * Selenium WebDriver script to automate location selection on JioMart
  * This script opens JioMart, navigates to search page, and selects a location
  */
-async function selectLocationOnJioMart(locationName, searchUrl = 'https://www.jiomart.com/search?q=tomoto') {
+async function selectLocationOnJioMart(locationName, productName = 'tomato') {
+  // Construct search URL from product name
+  const searchUrl = `https://www.jiomart.com/search?q=${encodeURIComponent(productName)}`;
   // Setup Chrome options
   const chromeOptions = new chrome.Options();
   chromeOptions.addArguments('--start-maximized');
@@ -99,39 +101,57 @@ async function selectLocationOnJioMart(locationName, searchUrl = 'https://www.ji
     // Wait a bit for suggestions to load
     await driver.sleep(1500);
 
-    // Wait for suggestions to appear and select the location - verified working selector from MCP
-    // MCP verified: (//*[contains(text(), 'Mumbai')])[3] - using index [3] to skip input field
+    // Wait for suggestions to appear and select the location
     let suggestionClicked = false;
     
-    // Try index [3] first as it worked in MCP testing
-    const suggestionXpath = `(//*[contains(text(), '${locationName}')])[3]`;
+    // Try multiple approaches to find the suggestion
+    const locationVariations = [
+      locationName,                    // Exact match
+      locationName.replace(/\s+/g, ''), // Without spaces (RTnagar)
+      locationName.replace(/\s+/g, ' '), // Normalized spaces (RT Nagar)
+    ];
     
-    try {
-      const suggestion = await driver.wait(
-        until.elementLocated(By.xpath(suggestionXpath)),
-        5000
-      );
-      await driver.wait(until.elementIsVisible(suggestion), 2000);
-      await suggestion.click();
-      suggestionClicked = true;
-      console.log(`✓ Location suggestion clicked using index [3]: ${locationName}`);
-    } catch (e) {
-      // Try alternative indices if [3] doesn't work
-      for (let i = 2; i <= 5; i++) {
+    // Try different XPath strategies
+    const suggestionStrategies = [
+      // Strategy 1: Try indices 2-6 (skip input field)
+      ...Array.from({length: 5}, (_, i) => i + 2).map(i => 
+        locationVariations.map(loc => `(//*[contains(text(), '${loc}')])[${i}]`)
+      ).flat(),
+      // Strategy 2: Find in list items
+      ...locationVariations.map(loc => `//li[contains(text(), '${loc}')]`),
+      // Strategy 3: Find in divs with location text
+      ...locationVariations.map(loc => `//div[contains(text(), '${loc}') and not(ancestor::input)]`),
+      // Strategy 4: Find any element with location text (excluding input)
+      ...locationVariations.map(loc => `//*[contains(text(), '${loc}') and not(self::input) and not(ancestor::input)]`)
+    ];
+    
+    for (const selector of suggestionStrategies) {
+      try {
+        const suggestion = await driver.wait(
+          until.elementLocated(By.xpath(selector)),
+          2000
+        );
+        await driver.wait(until.elementIsVisible(suggestion), 1000);
+        
+        // Scroll into view
+        await driver.executeScript('arguments[0].scrollIntoView({block: "center", behavior: "smooth"});', suggestion);
+        await driver.sleep(500);
+        
+        // Try regular click first
         try {
-          const altSuggestionXpath = `(//*[contains(text(), '${locationName}')])[${i}]`;
-          const suggestion = await driver.wait(
-            until.elementLocated(By.xpath(altSuggestionXpath)),
-            2000
-          );
-          await driver.wait(until.elementIsVisible(suggestion), 1000);
           await suggestion.click();
           suggestionClicked = true;
-          console.log(`✓ Location suggestion clicked using index [${i}]: ${locationName}`);
+          console.log(`✓ Location suggestion clicked using: ${selector}`);
           break;
-        } catch (e2) {
-          continue;
+        } catch (e) {
+          // If regular click fails, use JavaScript click
+          await driver.executeScript('arguments[0].click();', suggestion);
+          suggestionClicked = true;
+          console.log(`✓ Location suggestion clicked using JavaScript: ${selector}`);
+          break;
         }
+      } catch (e) {
+        continue;
       }
     }
 
@@ -217,7 +237,12 @@ async function selectLocationOnJioMart(locationName, searchUrl = 'https://www.ji
       .replace(/\s+/g, ' ')     // Replace multiple spaces with single space
       .trim();
     
-    const htmlPath = `jiomart-${locationName.toLowerCase().replace(/\s+/g, '-')}-selected.html`;
+    // Ensure output directory exists (reuse existing fs variable)
+    const outputDir = 'output';
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+    const htmlPath = path.join(outputDir, `jiomart-${locationName.toLowerCase().replace(/\s+/g, '-')}-selected.html`);
     fs.writeFileSync(htmlPath, minifiedHtml, 'utf8');
     console.log(`✓ Page HTML saved: ${htmlPath}`);
     console.log(`✓ HTML length: ${minifiedHtml.length} characters`);
@@ -227,7 +252,12 @@ async function selectLocationOnJioMart(locationName, searchUrl = 'https://www.ji
     console.log(`📄 Final page HTML returned and saved to: ${htmlPath}`);
     console.log(`📸 Final screenshot saved to: ${screenshotPath}`);
 
-    // Return the HTML before closing
+    // Close browser AFTER HTML is retrieved
+    console.log('\n=== Closing browser ===');
+    await driver.quit();
+    console.log('Browser closed.');
+
+    // Return the HTML
     return minifiedHtml;
 
   } catch (error) {
@@ -241,12 +271,14 @@ async function selectLocationOnJioMart(locationName, searchUrl = 'https://www.ji
     } catch (e) {
       // Ignore screenshot errors
     }
+    // Close browser on error
+    try {
+      await driver.quit();
+      console.log('Browser closed after error.');
+    } catch (e) {
+      // Ignore if already closed
+    }
     throw error;
-  } finally {
-    // Close the browser
-    console.log('\n=== Closing browser ===');
-    await driver.quit();
-    console.log('Browser closed.');
   }
 }
 
@@ -255,13 +287,13 @@ async function main() {
   // Example: Select different locations
   const locations = ['Mumbai', 'Bangalore', 'Chennai', 'Delhi'];
   
-  // Get location and URL from command line arguments
+  // Get location and product from command line arguments
   const locationToSelect = process.argv[2] || locations[0];
-  const searchUrl = process.argv[3] || 'https://www.jiomart.com/search?q=tomoto';
+  const productName = process.argv[3] || 'tomato';
   
   console.log(`Starting location selection for: ${locationToSelect}`);
-  console.log(`URL: ${searchUrl}`);
-  const pageHtml = await selectLocationOnJioMart(locationToSelect, searchUrl);
+  console.log(`Product: ${productName}`);
+  const pageHtml = await selectLocationOnJioMart(locationToSelect, productName);
   console.log(`\nPage HTML length: ${pageHtml.length} characters`);
   return pageHtml;
 }
